@@ -4,6 +4,7 @@ import { EventEmitter } from 'events';
 import { emitJobUpdate } from '@/config/socket';
 import os from 'os';
 import IORedis from 'ioredis';
+import { Worker } from 'worker_threads';
 import { 
     QueueEventBus, 
     JobStateManager, 
@@ -33,11 +34,11 @@ export abstract class BaseProcessingQueue<T extends BaseJob> extends EventEmitte
     protected readonly useStreamingAdd: boolean;
     
     // Component managers
-    protected eventBus: QueueEventBus;
-    protected jobStateManager: JobStateManager;
-    protected jobLifecycleManager: JobLifecycleManager;
-    protected workerPoolManager: WorkerPoolManager;
-    protected jobStatusManager: JobStatusManager;
+    protected eventBus!: QueueEventBus;
+    protected jobStateManager!: JobStateManager;
+    protected jobLifecycleManager!: JobLifecycleManager;
+    protected workerPoolManager!: WorkerPoolManager;
+    protected jobStatusManager!: JobStatusManager;
     
     protected isShutdown = false;
     protected isPaused = false;
@@ -355,7 +356,7 @@ export abstract class BaseProcessingQueue<T extends BaseJob> extends EventEmitte
             return;
         }
 
-        const workerId = availableWorkerItem.worker.threadId;
+        const workerId = availableWorkerItem.worker.threadId!;
         
         // Add job to state manager
         this.jobStateManager.addJob(job, rawData);
@@ -389,14 +390,14 @@ export abstract class BaseProcessingQueue<T extends BaseJob> extends EventEmitte
         }
     }
 
-    private setupWorkerMessageHandler(worker: any): void {
+    private setupWorkerMessageHandler(worker: Worker): void {
         // Prevent multiple listeners on the same worker
-        if (worker._hasMessageHandler) {
+        if ((worker as any)._hasMessageHandler) {
             return;
         }
         
-        worker._hasMessageHandler = true;
-        worker.on('message', (message: any) => this.handleWorkerMessage(worker.threadId, message));
+        (worker as any)._hasMessageHandler = true;
+        worker.on('message', (message: any) => this.handleWorkerMessage(worker.threadId!, message));
     }
 
     private async handleWorkerMessage(workerId: number, message: any): Promise<void>{
@@ -442,7 +443,7 @@ export abstract class BaseProcessingQueue<T extends BaseJob> extends EventEmitte
         }
     }
 
-    private async handleJobRequeue(job: T, rawData: string): Promise<void> {
+    private async handleJobRequeue(job: BaseJob, rawData: string): Promise<void> {
         try{
             await redis!.multi()
                 .lpush(this.queueKey, rawData)
@@ -455,83 +456,20 @@ export abstract class BaseProcessingQueue<T extends BaseJob> extends EventEmitte
         }
     }
 
-    private getBestAvailableWorker(): WorkerPoolItem | undefined {
-        const idleWorkers = this.workerPool.filter(item => item.isIdle);
+
+
+
+
+    private async checkAndCleanupSession(jobId: string): Promise<void> {
+        const jobState = this.jobStateManager.getJobState(jobId);
+        if (!jobState) return;
         
-        if(idleWorkers.length === 0) return undefined;
+        const sessionId = jobState.sessionId;
+        const trajectoryId = jobState.trajectoryId;
+        const teamId = jobState.teamId;
         
-        return idleWorkers.reduce((best, current) => {
-            if(current.jobCount < best.jobCount) return current;
-            if(current.jobCount === best.jobCount && current.lastUsed < best.lastUsed) return current;
-            return best;
-        });
-    }
-
-    private async handleJobTimeout(workerId: number, jobId: string): Promise<void> {
-        const jobInfo = this.jobMap.get(workerId);
-        if(jobInfo && jobInfo.job.jobId === jobId){
-            console.warn(`[${this.queueName}] Job ${jobId} timed out, terminating worker #${workerId}`);
-            await this.handleWorkerError(workerId, new Error(`Job ${jobId} timed out after ${this.jobTimeout}ms`));
-        }
-    }
-
-    private async handleWorkerMessage(workerId: number, message: any): Promise<void>{
-        const jobInfo = this.jobMap.get(workerId);
-        if(!jobInfo) return;
-
-        const { job, rawData, startTime } = jobInfo;
-        const processingTime = Date.now() - startTime;
-        const workerItem = this.workerPool.find(item => item.worker.threadId === workerId);
-        
-        if(workerItem){
-            this.clearWorkerTimeouts(workerItem);
-        }
-        
-        switch(message.status){
-            case 'completed':
-                await this.setJobStatus(job.jobId, 'completed', { 
-                    result: message.result,
-                    processingTimeMs: processingTime,
-                    teamId: job.teamId,
-                    trajectoryId: (job as any).trajectoryId
-                });
-                this.updateMetrics(processingTime, false);
-                this.emit('jobCompleted', { job, result: message.result, processingTime });
-                
-                await this.checkAndCleanupSession(job);
-                break;
-
-            case 'failed':
-                const shouldCleanupSession = await this.handleJobFailure(job, message.error, processingTime);
-                
-                if(shouldCleanupSession) {
-                    await this.checkAndCleanupSession(job);
-                }
-                break;
-            
-            case 'progress':
-                await this.setJobStatus(job.jobId, 'running', { 
-                    progress: message.progress,
-                    processingTimeMs: processingTime,
-                    teamId: job.teamId,
-                    trajectoryId: (job as any).trajectoryId
-                });
-                this.emit('jobProgress', { job, progress: message.progress });
-                return;
-        }
-
-        if(message.status === 'completed' || message.status === 'failed'){
-            await redis!.lrem(this.processingKey, 1, rawData);
-            this.releaseWorker(workerId);   
-        }
-    }
-
-    private async checkAndCleanupSession(job: T): Promise<void> {
-        const sessionId = (job as any).sessionId;
-        const trajectoryId = (job as any).trajectoryId;
-        
-        if(!sessionId || !trajectoryId) {
-            console.log(`Job ${job.jobId} has no session info, skipping session cleanup`);
+        if(!sessionId || !trajectoryId || !teamId) {
+            console.log(`Job ${jobId} has no session info, skipping session cleanup`);
             return;
         }
 
@@ -596,7 +534,7 @@ export abstract class BaseProcessingQueue<T extends BaseJob> extends EventEmitte
                 0, 
                 sessionId, 
                 trajectoryId, 
-                job.teamId, 
+                teamId, 
                 this.statusKeyPrefix
             ) as [number, number, string];
 
@@ -607,15 +545,15 @@ export abstract class BaseProcessingQueue<T extends BaseJob> extends EventEmitte
                 
                 console.log(`Session ${sessionId} CLEANED! Deleted ${count} jobs`);
                 
-                console.log(`Emitting session_expired event for team ${job.teamId}`);
-                this.emitSessionExpired(job.teamId, sessionId, trajectoryId);
+                console.log(`Emitting session_expired event for team ${teamId}`);
+                this.emitSessionExpired(teamId, sessionId, trajectoryId);
                 
                 setTimeout(() => {
                     this.sessionsBeingCleaned.delete(sessionId);
                 }, 10000);
                 
             } else if(status === "pending") {
-                console.log(`Job ${job.jobId} finished. ${count} jobs still pending in session ${sessionId}`);
+                console.log(`Job ${jobId} finished. ${count} jobs still pending in session ${sessionId}`);
             } else {
                 console.log(`Session ${sessionId} status: ${status}`);
             }
@@ -638,109 +576,7 @@ export abstract class BaseProcessingQueue<T extends BaseJob> extends EventEmitte
         console.log(`Session expired event emitted to team ${teamId}`);
     }
 
-    private clearWorkerTimeouts(workerItem: WorkerPoolItem): void {
-        for(const timeout of workerItem.timeouts){
-            clearTimeout(timeout);
-        }
-        workerItem.timeouts.clear();
-    }
 
-    private async handleJobFailure(job: T, error: string, processingTime: number): Promise<boolean> {
-        const retries = job.retries || 0;
-        const maxRetries = job.maxRetries || 3;
-        
-        if(retries < maxRetries){
-            const retryJob = { ...job, retries: retries + 1 };
-            await this.addJobs([retryJob]);
-            await this.setJobStatus(job.jobId, 'retrying', { 
-                error,
-                retries: retries + 1,
-                maxRetries,
-                trajectoryId: (job as any).trajectoryId,
-                processingTimeMs: processingTime,
-                teamId: job.teamId
-            });
-            this.emit('jobRetry', { job: retryJob, error, attempt: retries + 1 });
-            return false;
-        } else {
-            await this.setJobStatus(job.jobId, 'failed', { 
-                error,
-                finalAttempt: true,
-                processingTimeMs: processingTime,
-                teamId: job.teamId,
-                trajectoryId: (job as any).trajectoryId,
-            });
-            this.updateMetrics(processingTime, true);
-            this.emit('jobFailed', { job, error, processingTime });
-            return true;
-        }
-    }
-
-    private releaseWorker(workerId: number): void {
-        const workerItem = this.workerPool.find(item => item.worker.threadId === workerId);
-        if(workerItem){
-            this.clearWorkerTimeouts(workerItem);
-            workerItem.isIdle = true;
-            workerItem.currentJobId = undefined;
-            workerItem.startTime = undefined;
-            workerItem.lastUsed = Date.now();
-            workerItem.jobCount++;
-        }
-        this.jobMap.delete(workerId);
-    }
-
-    private async handleWorkerError(workerId: number, err: Error): Promise<void> {
-        console.error(`[${this.queueName}] Worker #${workerId} error:`, err);
-        await this.requeueJob(workerId, err.message);
-        this.replaceWorker(workerId);
-    }
-
-    private handleWorkerExit(workerId: number, code: number): void {
-        console.log(`[${this.queueName}] Worker #${workerId} exited with code ${code}`);
-        
-        if(code !== 0){
-            const errorMessage = `Worker #${workerId} exited unexpectedly with code ${code}`;
-            this.requeueJob(workerId, errorMessage);
-        }
-        
-        this.replaceWorker(workerId);
-    }
-
-    private async requeueJob(workerId: number, errorMessage: string): Promise<void> {
-        const jobInfo = this.jobMap.get(workerId);
-        if(jobInfo){
-            const { job, rawData } = jobInfo;
-            
-            try{
-                await redis!.multi()
-                    .lpush(this.queueKey, rawData)
-                    .lrem(this.processingKey, 1, rawData)
-                    .exec();
-                
-                await this.setJobStatus(job.jobId, 'queued_after_failure', { error: errorMessage, teamId: job.teamId, trajectoryId: (job as any).trajectoryId });
-                console.log(`[${this.queueName}] Requeued job ${job.jobId} due to worker failure`);
-            }catch(error){
-                console.error(`[${this.queueName}] Failed to requeue job:`, error);
-            }
-            
-            this.jobMap.delete(workerId);
-        }
-    }
-
-    private replaceWorker(workerId: number): void {
-        const workerIndex = this.workerPool.findIndex(item => item.worker.threadId === workerId);
-        
-        if(workerIndex !== -1){
-            const oldWorker = this.workerPool[workerIndex];
-            this.clearWorkerTimeouts(oldWorker);
-            oldWorker.worker.terminate();
-            
-            this.workerPool[workerIndex] = this.createWorkerItem();
-            this.metrics.workerRestarts++;
-            
-            console.log(`[${this.queueName}] Replaced worker #${workerId} with new worker #${this.workerPool[workerIndex].worker.threadId}`);
-        }
-    }
 
     public async addJobs(jobs: T[]): Promise<void> {
         if(jobs.length === 0) return;
@@ -765,7 +601,7 @@ export abstract class BaseProcessingQueue<T extends BaseJob> extends EventEmitte
             startTime: sessionStartTime,
             totalJobs: jobs.length,
             trajectoryId: (jobs[0] as any).trajectoryId,
-            teamId: jobs[0].teamId,
+            teamId: (jobs[0] as any).teamId,
             status: 'active'
         }));
         
@@ -783,16 +619,8 @@ export abstract class BaseProcessingQueue<T extends BaseJob> extends EventEmitte
                 const stringifiedJob = JSON.stringify(job);
                 await redis!.lpush(this.queueKey, stringifiedJob);
 
-                await this.setJobStatus(job.jobId, 'queued', {
-                    name: job.name,
-                    message: job.message,
-                    sessionId: sessionId,
-                    sessionStartTime: sessionStartTime,
-                    trajectoryId: (job as any).trajectoryId, 
-                    ...(job as any).chunkIndex !== undefined && { chunkIndex: (job as any).chunkIndex },
-                    ...(job as any).totalChunks !== undefined && { totalChunks: (job as any).totalChunks },
-                    teamId: job.teamId
-                });
+                // Add job to state manager
+                this.jobStateManager.addJob(job as T, stringifiedJob, sessionId);
 
                 await new Promise((resolve) => setTimeout(resolve, 50));
             }
@@ -812,6 +640,9 @@ export abstract class BaseProcessingQueue<T extends BaseJob> extends EventEmitte
                 } else {
                     regularJobs.push(serialized);
                 }
+                
+                // Add job to state manager  
+                this.jobStateManager.addJob(job as T, serialized, sessionId);
             }
             
             if(priorityJobs.length > 0){
@@ -822,21 +653,6 @@ export abstract class BaseProcessingQueue<T extends BaseJob> extends EventEmitte
             }
             
             await queuePipeline.exec();
-
-            const statusPromises = jobsWithSession.map(job => 
-                this.setJobStatus(job.jobId, 'queued', {
-                    teamId: job.teamId,
-                    trajectoryId: (job as any).trajectoryId,
-                    name: job.name,
-                    sessionId: sessionId, 
-                    sessionStartTime: sessionStartTime,
-                    message: job.message,
-                    ...(job as any).chunkIndex !== undefined && { chunkIndex: (job as any).chunkIndex },
-                    ...(job as any).totalChunks !== undefined && { totalChunks: (job as any).totalChunks }
-                })
-            );
-            
-            await Promise.all(statusPromises);
 
             this.emit('jobsAdded', { 
                 count: jobs.length, 
@@ -850,119 +666,11 @@ export abstract class BaseProcessingQueue<T extends BaseJob> extends EventEmitte
         console.log(`Job session ${sessionId} created with atomic counter tracking`);
     }
 
-    protected async setJobStatus(jobId: string, status: string, data: any = {}): Promise<void> {
-        const jobInfoFromMap = Array.from(this.jobMap.values()).find((info) => info.job.jobId === jobId);
-        let existingJobData = null;
-        try{
-            const existingJobStatusString = await redis!.get(`${this.statusKeyPrefix}${jobId}`);
-            if(existingJobStatusString){
-                existingJobData = JSON.parse(existingJobStatusString);
-            }
-        }catch(error){
-            console.log(`Could not retrieve existing job data for ${jobId}:`, error);
-        }
 
-        const statusData = {
-            jobId,
-            status,
-            sessionId: data.sessionId || existingJobData?.sessionId || (jobInfoFromMap?.job as any)?.sessionId,
-            sessionStartTime: data.sessionStartTime || existingJobData?.sessionStartTime || (jobInfoFromMap?.job as any)?.sessionStartTime,
-            trajectoryId: data.trajectoryId || (jobInfoFromMap?.job as any)?.trajectoryId,
-            name: data.name || existingJobData?.name || jobInfoFromMap?.job.name,
-            message: data.message || existingJobData?.message || jobInfoFromMap?.job.message,
-            timestamp: new Date().toISOString(),
-            teamId: data.teamId || existingJobData?.teamId || jobInfoFromMap?.job.teamId, 
-            chunkIndex: data.chunkIndex !== undefined ? data.chunkIndex : existingJobData?.chunkIndex !== undefined ? existingJobData.chunkIndex : (jobInfoFromMap?.job as any)?.chunkIndex,
-            totalChunks: data.totalChunks !== undefined ? data.totalChunks : existingJobData?.totalChunks !== undefined ? existingJobData.totalChunks : (jobInfoFromMap?.job as any)?.totalChunks,
-            ...data
-        };
-
-        try{
-            const pipeline = redis!.pipeline();
-            
-            pipeline.setex(
-                `${this.statusKeyPrefix}${jobId}`,
-                86400 * 30,
-                JSON.stringify(statusData)
-            );
-
-            if(statusData.teamId){
-                const teamJobsKey = `team:${statusData.teamId}:jobs`;
-                pipeline.sadd(teamJobsKey, jobId);
-                pipeline.expire(teamJobsKey, 86400 * 30); 
-            }
-
-            await pipeline.exec();
-
-            if(statusData.teamId){
-                emitJobUpdate(statusData.teamId, statusData);
-            }
-            
-        }catch(err){
-            console.error(`[${this.queueName}] Failed to set job status for ${jobId}:`, err);
-        }
-    }
 
     protected abstract deserializeJob(rawData: string): T;
 
-    private initializeWorkerPool(): void {
-        console.log(`[${this.queueName}] Initializing worker pool with ${this.maxConcurrentJobs} workers.`);
 
-        for(let i = 0; i < this.maxConcurrentJobs; i++){
-            this.workerPool.push(this.createWorkerItem());
-        }
-        
-        this.startWorkerCleanup();
-    }
-
-    private createWorkerItem(): WorkerPoolItem {
-        return {
-            worker: this.createWorker(),
-            isIdle: true,
-            jobCount: 0,
-            lastUsed: Date.now(),
-            timeouts: new Set()
-        };
-    }
-
-    private createWorker(): Worker {
-        const worker = new Worker(this.workerPath, {
-            execArgv: ['-r', 'ts-node/register', '-r', 'tsconfig-paths/register']
-        });
-
-        worker.on('message', (message) => this.handleWorkerMessage(worker.threadId, message));
-        worker.on('error', (err) => this.handleWorkerError(worker.threadId, err));
-        worker.on('exit', (code) => this.handleWorkerExit(worker.threadId, code));
-        
-        return worker;
-    }
-
-    private startWorkerCleanup(): void {
-        setInterval(() => {
-            if(this.isShutdown || this.workerPool.length <= 1) return;
-            
-            const now = Date.now();
-            const workersToRemove: number[] = [];
-            
-            for(let i = 0; i < this.workerPool.length; i++){
-                const item = this.workerPool[i];
-                if(item.isIdle && (now - item.lastUsed) > this.workerIdleTimeout){
-                    workersToRemove.push(i);
-                }
-            }
-            
-            if(workersToRemove.length > 0 && this.workerPool.length - workersToRemove.length >= 1){
-                for(let i = workersToRemove.length - 1; i >= 0; i--){
-                    const index = workersToRemove[i];
-                    const item = this.workerPool[index];
-                    this.clearWorkerTimeouts(item);
-                    item.worker.terminate();
-                    this.workerPool.splice(index, 1);
-                }
-                console.log(`[${this.queueName}] Cleaned up ${workersToRemove.length} idle workers`);
-            }
-        }, this.workerIdleTimeout / 3);
-    }
 
     private startHealthChecking(): void {
         this.healthCheckInterval_ = setInterval(async () => {
@@ -979,15 +687,28 @@ export abstract class BaseProcessingQueue<T extends BaseJob> extends EventEmitte
         this.metrics.peakMemoryUsageMB = Math.max(this.metrics.peakMemoryUsageMB, currentMemory);
         this.metrics.lastHealthCheck = new Date().toISOString();
         
+        // Check for jobs approaching timeout using the new job state manager
+        const activeJobs = this.jobLifecycleManager.getActiveJobs();
         const now = Date.now();
-        for(const [workerId, jobInfo] of this.jobMap.entries()){
-            const processingTime = now - jobInfo.startTime;
-            if(processingTime > this.jobTimeout * 0.9){
-                console.warn(`[${this.queueName}] Job ${jobInfo.job.jobId} on worker #${workerId} approaching timeout`);
+        
+        for(const jobState of activeJobs){
+            if(jobState.startTime){
+                const processingTime = now - jobState.startTime;
+                if(processingTime > this.jobTimeout * 0.9){
+                    console.warn(`[${this.queueName}] Job ${jobState.jobId} on worker #${jobState.workerId} approaching timeout`);
+                }
             }
         }
         
-        this.emit('healthCheck', this.metrics);
+        // Emit health check with combined metrics from lifecycle manager
+        const lifecycleMetrics = this.jobLifecycleManager.getMetrics();
+        const combinedMetrics = {
+            ...this.metrics,
+            ...lifecycleMetrics
+        };
+        
+        this.eventBus.emitSystemHealthCheck(combinedMetrics, this.queueName);
+        this.emit('healthCheck', combinedMetrics);
     }
 
     private updateMetrics(processingTime: number, failed: boolean): void {
@@ -1015,14 +736,16 @@ export abstract class BaseProcessingQueue<T extends BaseJob> extends EventEmitte
             const pendingJobs = (results?.[0]?.[1] as number) || 0;
             const processingJobs = (results?.[1]?.[1] as number) || 0;
             const priorityJobs = (results?.[2]?.[1] as number) || 0;
-            const activeWorkers = this.workerPool.filter(item => !item.isIdle).length;
+            
+            // Get worker status from worker pool manager
+            const workerStatus = this.workerPoolManager.getStatus();
             const serverLoad = this.isServerOverloaded();
 
             return {
                 queueName: this.queueName,
                 maxConcurrent: this.maxConcurrentJobs,
-                activeWorkers,
-                totalWorkers: this.workerPool.length,
+                activeWorkers: workerStatus.activeWorkers,
+                totalWorkers: workerStatus.totalWorkers,
                 pendingJobs: pendingJobs + priorityJobs,
                 processingJobs,
                 priorityJobs,
@@ -1032,7 +755,8 @@ export abstract class BaseProcessingQueue<T extends BaseJob> extends EventEmitte
                 circuitBreaker: {
                     isOpen: this.circuitBreaker.isOpen(),
                     failures: this.circuitBreaker.failures
-                }
+                },
+                workerDetails: workerStatus.workers
             };
         }catch(error){
             console.error(`[${this.queueName}] Failed to get status:`, error);
@@ -1091,19 +815,20 @@ export abstract class BaseProcessingQueue<T extends BaseJob> extends EventEmitte
             clearInterval(this.healthCheckInterval_);
         }
         
+        // Wait for active jobs to complete using the new job state manager
         const shutdownStart = Date.now();
-        while(this.jobMap.size > 0 && (Date.now() - shutdownStart) < this.gracefulShutdownTimeout){
-            console.log(`[${this.queueName}] Waiting for ${this.jobMap.size} jobs to complete...`);
+        while(this.jobStateManager.getJobsByStatus('running').length > 0 && 
+              (Date.now() - shutdownStart) < this.gracefulShutdownTimeout){
+            console.log(`[${this.queueName}] Waiting for ${this.jobStateManager.getJobsByStatus('running').length} jobs to complete...`);
             await this.sleep(1000);
         }
         
-        console.log(`[${this.queueName}] Terminating ${this.workerPool.length} workers...`);
-        const terminatePromises = this.workerPool.map(item => {
-            this.clearWorkerTimeouts(item);
-            return item.worker.terminate().catch(() => {});
-        });
+        // Shutdown worker pool manager
+        await this.workerPoolManager.shutdown();
         
-        await Promise.allSettled(terminatePromises);
+        // Cleanup job state manager
+        this.jobStateManager.cleanup();
+        
         this.redisListenerClient.disconnect();
         
         console.log(`[${this.queueName}] Graceful shutdown complete.`);

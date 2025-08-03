@@ -1,3 +1,5 @@
+import { Worker } from 'worker_threads';
+
 export interface BaseJob {
     jobId: string;
     priority?: number;

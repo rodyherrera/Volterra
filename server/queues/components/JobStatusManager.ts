@@ -1,3 +1,4 @@
+import { BaseJob } from '@/types/queues/base-processing-queue';
 import { redis } from '@config/redis';
 import { emitJobUpdate } from '@/config/socket';
 import { QueueEventBus, JobEvent } from './QueueEventBus';
@@ -175,7 +176,7 @@ export class JobStatusManager {
     }
     
     // Event handlers
-    private async handleJobQueued(event: JobEvent): void {
+    private async handleJobQueued(event: JobEvent): Promise<void> {
         await this.setJobStatus(event.jobId, 'queued', {
             sessionId: event.payload.sessionId,
             teamId: event.payload.job.teamId,
@@ -187,7 +188,7 @@ export class JobStatusManager {
         });
     }
     
-    private async handleJobStarted(event: JobEvent): void {
+    private async handleJobStarted(event: JobEvent): Promise<void> {
         await this.setJobStatus(event.jobId, 'running', {
             workerId: event.workerId,
             startTime: new Date(event.payload.startTime).toISOString(),
@@ -196,7 +197,7 @@ export class JobStatusManager {
         });
     }
     
-    private async handleJobProgress(event: JobEvent): void {
+    private async handleJobProgress(event: JobEvent): Promise<void> {
         const processingTime = this.calculateProcessingTime(event.jobId);
         
         await this.setJobStatus(event.jobId, 'running', {
@@ -205,7 +206,7 @@ export class JobStatusManager {
         });
     }
     
-    private async handleJobCompleted(event: JobEvent): void {
+    private async handleJobCompleted(event: JobEvent): Promise<void> {
         const processingTime = this.calculateProcessingTime(event.jobId);
         
         await this.setJobStatus(event.jobId, 'completed', {
@@ -214,7 +215,7 @@ export class JobStatusManager {
         });
     }
     
-    private async handleJobFailed(event: JobEvent): void {
+    private async handleJobFailed(event: JobEvent): Promise<void> {
         const processingTime = this.calculateProcessingTime(event.jobId);
         const jobState = this.jobStateManager.getJobState(event.jobId);
         
@@ -227,7 +228,7 @@ export class JobStatusManager {
         });
     }
     
-    private async handleJobRetry(event: JobEvent): void {
+    private async handleJobRetry(event: JobEvent): Promise<void> {
         const processingTime = this.calculateProcessingTime(event.jobId);
         const jobState = this.jobStateManager.getJobState(event.jobId);
         

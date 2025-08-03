@@ -1,5 +1,5 @@
 import { WorkerPoolItem } from '@/types/queues/base-processing-queue';
-import { Worker } from 'worker_threads';
+import { Worker as NodeWorker } from 'worker_threads';
 import { QueueEventBus, WorkerEvent } from './QueueEventBus';
 
 export interface WorkerPoolConfig {
@@ -59,21 +59,21 @@ export class WorkerPoolManager {
             timeouts: new Set()
         };
         
-        this.eventBus.emitWorkerCreated(worker.threadId, 'WorkerPoolManager');
+        this.eventBus.emitWorkerCreated(worker.threadId!, 'WorkerPoolManager');
         return workerItem;
     }
     
-    private createWorker(): Worker {
-        const worker = new Worker(this.config.workerPath, {
+    private createWorker(): NodeWorker {
+        const worker = new NodeWorker(this.config.workerPath, {
             execArgv: ['-r', 'ts-node/register', '-r', 'tsconfig-paths/register']
         });
         
         worker.on('error', (err) => {
-            this.eventBus.emitWorkerError(worker.threadId, err, 'WorkerPoolManager');
+            this.eventBus.emitWorkerError(worker.threadId!, err, 'WorkerPoolManager');
         });
         
         worker.on('exit', (code) => {
-            this.eventBus.emitWorkerTerminated(worker.threadId, code, 'WorkerPoolManager');
+            this.eventBus.emitWorkerTerminated(worker.threadId!, code, 'WorkerPoolManager');
         });
         
         return worker;
@@ -96,7 +96,7 @@ export class WorkerPoolManager {
     }
     
     public assignWorker(workerId: number, jobId: string): boolean {
-        const workerItem = this.workerPool.find(item => item.worker.threadId === workerId);
+        const workerItem = this.workerPool.find(item => item.worker.threadId! === workerId);
         if (!workerItem || !workerItem.isIdle) {
             return false;
         }
@@ -110,7 +110,7 @@ export class WorkerPoolManager {
     }
     
     public releaseWorker(workerId: number): void {
-        const workerItem = this.workerPool.find(item => item.worker.threadId === workerId);
+        const workerItem = this.workerPool.find(item => item.worker.threadId! === workerId);
         if (workerItem) {
             this.clearWorkerTimeouts(workerItem);
             workerItem.isIdle = true;
@@ -124,7 +124,7 @@ export class WorkerPoolManager {
     }
     
     public getWorkerItem(workerId: number): WorkerPoolItem | undefined {
-        return this.workerPool.find(item => item.worker.threadId === workerId);
+        return this.workerPool.find(item => item.worker.threadId! === workerId);
     }
     
     public addTimeout(workerId: number, timeout: NodeJS.Timeout): void {
@@ -158,7 +158,7 @@ export class WorkerPoolManager {
     }
     
     private replaceWorker(workerId: number): void {
-        const workerIndex = this.workerPool.findIndex(item => item.worker.threadId === workerId);
+        const workerIndex = this.workerPool.findIndex(item => item.worker.threadId! === workerId);
         
         if (workerIndex !== -1) {
             const oldWorker = this.workerPool[workerIndex];
@@ -172,7 +172,7 @@ export class WorkerPoolManager {
             // Create a new worker
             this.workerPool[workerIndex] = this.createWorkerItem();
             
-            console.log(`[WorkerPoolManager] Replaced worker #${workerId} with new worker #${this.workerPool[workerIndex].worker.threadId}`);
+            console.log(`[WorkerPoolManager] Replaced worker #${workerId} with new worker #${this.workerPool[workerIndex].worker.threadId!}`);
         }
     }
     
@@ -230,7 +230,7 @@ export class WorkerPoolManager {
             idleWorkers,
             activeWorkers: this.workerPool.length - idleWorkers,
             workers: this.workerPool.map(item => ({
-                threadId: item.worker.threadId,
+                threadId: item.worker.threadId!,
                 isIdle: item.isIdle,
                 currentJobId: item.currentJobId,
                 jobCount: item.jobCount,
