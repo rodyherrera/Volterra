@@ -1,10 +1,18 @@
-import { BaseJob, WorkerPoolItem, QueueMetrics, QueueOptions, CircuitBreaker } from '@/types/queues/base-processing-queue';
+import { BaseJob, QueueMetrics, QueueOptions, CircuitBreaker } from '@/types/queues/base-processing-queue';
 import { createRedisClient, redis } from '@config/redis';
-import { Worker } from 'worker_threads';
 import { EventEmitter } from 'events';
 import { emitJobUpdate } from '@/config/socket';
 import os from 'os';
 import IORedis from 'ioredis';
+import { 
+    QueueEventBus, 
+    JobStateManager, 
+    JobLifecycleManager, 
+    WorkerPoolManager, 
+    JobStatusManager,
+    WorkerPoolConfig,
+    RetryConfig
+} from './components';
 
 export abstract class BaseProcessingQueue<T extends BaseJob> extends EventEmitter {
     protected readonly queueName: string;
@@ -24,8 +32,13 @@ export abstract class BaseProcessingQueue<T extends BaseJob> extends EventEmitte
     protected readonly numCpus: number;
     protected readonly useStreamingAdd: boolean;
     
-    protected workerPool: WorkerPoolItem[] = [];
-    protected jobMap = new Map<number, { job: T; rawData: string; startTime: number }>();
+    // Component managers
+    protected eventBus: QueueEventBus;
+    protected jobStateManager: JobStateManager;
+    protected jobLifecycleManager: JobLifecycleManager;
+    protected workerPoolManager: WorkerPoolManager;
+    protected jobStatusManager: JobStatusManager;
+    
     protected isShutdown = false;
     protected isPaused = false;
     protected redisListenerClient: IORedis;
@@ -91,14 +104,103 @@ export abstract class BaseProcessingQueue<T extends BaseJob> extends EventEmitte
             lastHealthCheck: new Date().toISOString()
         };
 
+        this.initializeComponents();
         this.initializeQueue();
+    }
+
+    private initializeComponents(): void {
+        // Initialize component managers
+        this.eventBus = QueueEventBus.getInstance();
+        this.jobStateManager = JobStateManager.getInstance();
+        
+        const retryConfig: RetryConfig = {
+            maxRetries: 3,
+            retryDelay: 1000,
+            backoffMultiplier: 2,
+            maxRetryDelay: 30000
+        };
+        this.jobLifecycleManager = JobLifecycleManager.getInstance(retryConfig);
+        
+        const workerPoolConfig: WorkerPoolConfig = {
+            workerPath: this.workerPath,
+            maxWorkers: this.maxConcurrentJobs,
+            workerIdleTimeout: this.workerIdleTimeout,
+            cleanupInterval: this.workerIdleTimeout / 3
+        };
+        this.workerPoolManager = WorkerPoolManager.getInstance(this.queueName, workerPoolConfig);
+        
+        this.jobStatusManager = JobStatusManager.getInstance(this.statusKeyPrefix);
+        
+        this.setupComponentEventListeners();
+    }
+
+    private setupComponentEventListeners(): void {
+        // Listen for job lifecycle events
+        this.eventBus.onJobCompleted((event) => {
+            this.updateMetrics(this.calculateProcessingTime(event.jobId), false);
+            this.emit('jobCompleted', { 
+                job: this.jobStateManager.getJobState(event.jobId)?.job, 
+                result: event.payload.result, 
+                processingTime: this.calculateProcessingTime(event.jobId) 
+            });
+            this.checkAndCleanupSession(event.jobId);
+        });
+
+        this.eventBus.onJobFailed((event) => {
+            this.updateMetrics(this.calculateProcessingTime(event.jobId), true);
+            this.emit('jobFailed', { 
+                job: this.jobStateManager.getJobState(event.jobId)?.job, 
+                error: event.payload.error, 
+                processingTime: this.calculateProcessingTime(event.jobId) 
+            });
+        });
+
+        this.eventBus.onJobProgress((event) => {
+            this.emit('jobProgress', { 
+                job: this.jobStateManager.getJobState(event.jobId)?.job, 
+                progress: event.payload.progress 
+            });
+        });
+
+        this.eventBus.onJobRetry((event) => {
+            const jobState = this.jobStateManager.getJobState(event.jobId);
+            if (jobState) {
+                this.emit('jobRetry', { 
+                    job: jobState.job, 
+                    error: event.payload.error, 
+                    attempt: event.payload.retryCount 
+                });
+            }
+        });
+
+        // Listen for job requeue events
+        this.eventBus.on('job:requeue', (event) => {
+            this.handleJobRequeue(event.payload.job, event.payload.rawData);
+        });
+
+        // Listen for worker events
+        this.eventBus.onWorkerTerminated((event) => {
+            this.metrics.workerRestarts++;
+            this.handleWorkerFailure(event.workerId);
+        });
+
+        this.eventBus.onWorkerError((event) => {
+            this.handleWorkerFailure(event.workerId);
+        });
+    }
+
+    private calculateProcessingTime(jobId: string): number {
+        const jobState = this.jobStateManager.getJobState(jobId);
+        if (!jobState || !jobState.startTime) {
+            return 0;
+        }
+        return Date.now() - jobState.startTime;
     }
 
     private async initializeQueue(): Promise<void> {
         try{
             console.log(`[${this.queueName}] Initializing optimized queue...`);
             
-            this.initializeWorkerPool();
             this.startDispatchingJobs();
             
             if(this.enableMetrics){
@@ -143,7 +245,7 @@ export abstract class BaseProcessingQueue<T extends BaseJob> extends EventEmitte
                     continue;
                 }
 
-                const availableWorkers = this.workerPool.filter(item => item.isIdle).length;
+                const availableWorkers = this.workerPoolManager.getStatus().idleWorkers;
                 if(availableWorkers === 0){
                     await this.sleep(100);
                     continue;
@@ -243,7 +345,7 @@ export abstract class BaseProcessingQueue<T extends BaseJob> extends EventEmitte
     }
 
     private async dispatchJobToWorker(job: T, rawData: string): Promise<void> {
-        const availableWorkerItem = this.getBestAvailableWorker();
+        const availableWorkerItem = this.workerPoolManager.getAvailableWorker();
         
         if(!availableWorkerItem){
             await redis!.multi()
@@ -253,34 +355,103 @@ export abstract class BaseProcessingQueue<T extends BaseJob> extends EventEmitte
             return;
         }
 
-        const startTime = Date.now();
-        availableWorkerItem.isIdle = false;
-        availableWorkerItem.currentJobId = job.jobId;
-        availableWorkerItem.startTime = startTime;
-        availableWorkerItem.lastUsed = startTime;
+        const workerId = availableWorkerItem.worker.threadId;
         
-        this.jobMap.set(availableWorkerItem.worker.threadId, { job, rawData, startTime });
+        // Add job to state manager
+        this.jobStateManager.addJob(job, rawData);
         
+        // Assign worker
+        if (!this.jobStateManager.assignWorker(job.jobId, workerId)) {
+            console.error(`[${this.queueName}] Failed to assign worker ${workerId} to job ${job.jobId}`);
+            return;
+        }
+        
+        // Update worker pool manager
+        this.workerPoolManager.assignWorker(workerId, job.jobId);
+        
+        // Set up job timeout
         const timeout = setTimeout(() => {
-            this.handleJobTimeout(availableWorkerItem.worker.threadId, job.jobId);
+            this.jobLifecycleManager.timeoutJob(job.jobId, workerId);
         }, this.jobTimeout);
         
-        availableWorkerItem.timeouts.add(timeout);
+        this.workerPoolManager.addTimeout(workerId, timeout);
         
         try{
-            await this.setJobStatus(job.jobId, 'running', { 
-                workerId: availableWorkerItem.worker.threadId,
-                startTime: new Date(startTime).toISOString(),
-                teamId: job.teamId,
-                trajectoryId: (job as any).trajectoryId
-            });
+            // Set up worker message handler if not already set
+            this.setupWorkerMessageHandler(availableWorkerItem.worker);
             
             availableWorkerItem.worker.postMessage({ job });
         }catch(error){
-            this.clearWorkerTimeouts(availableWorkerItem);
-            availableWorkerItem.isIdle = true;
-            this.jobMap.delete(availableWorkerItem.worker.threadId);
+            this.workerPoolManager.clearWorkerTimeouts(availableWorkerItem);
+            this.workerPoolManager.releaseWorker(workerId);
+            this.jobStateManager.releaseWorker(workerId);
             throw error;
+        }
+    }
+
+    private setupWorkerMessageHandler(worker: any): void {
+        // Prevent multiple listeners on the same worker
+        if (worker._hasMessageHandler) {
+            return;
+        }
+        
+        worker._hasMessageHandler = true;
+        worker.on('message', (message: any) => this.handleWorkerMessage(worker.threadId, message));
+    }
+
+    private async handleWorkerMessage(workerId: number, message: any): Promise<void>{
+        const jobState = this.jobStateManager.getJobByWorkerId(workerId);
+        if(!jobState) return;
+
+        const { job, rawData } = jobState;
+        
+        switch(message.status){
+            case 'completed':
+                this.jobLifecycleManager.completeJob(job.jobId, workerId, message.result);
+                await this.removeJobFromProcessing(rawData);
+                this.workerPoolManager.releaseWorker(workerId);
+                break;
+
+            case 'failed':
+                this.jobLifecycleManager.failJob(job.jobId, workerId, message.error);
+                await this.removeJobFromProcessing(rawData);
+                this.workerPoolManager.releaseWorker(workerId);
+                break;
+            
+            case 'progress':
+                this.jobLifecycleManager.updateJobProgress(job.jobId, workerId, message.progress);
+                return; // Don't release worker for progress updates
+        }
+    }
+
+    private async removeJobFromProcessing(rawData: string): Promise<void> {
+        try {
+            await redis!.lrem(this.processingKey, 1, rawData);
+        } catch (error) {
+            console.error(`[${this.queueName}] Failed to remove job from processing:`, error);
+        }
+    }
+
+    private handleWorkerFailure(workerId: number): void {
+        const jobId = this.jobStateManager.releaseWorker(workerId);
+        if (jobId) {
+            const jobState = this.jobStateManager.getJobState(jobId);
+            if (jobState) {
+                this.handleJobRequeue(jobState.job, jobState.rawData);
+            }
+        }
+    }
+
+    private async handleJobRequeue(job: T, rawData: string): Promise<void> {
+        try{
+            await redis!.multi()
+                .lpush(this.queueKey, rawData)
+                .lrem(this.processingKey, 1, rawData)
+                .exec();
+            
+            console.log(`[${this.queueName}] Requeued job ${job.jobId}`);
+        }catch(error){
+            console.error(`[${this.queueName}] Failed to requeue job:`, error);
         }
     }
 
